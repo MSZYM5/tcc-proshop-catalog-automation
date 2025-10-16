@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# Project data/outputs
+data/
+output/
+
+# OS/Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

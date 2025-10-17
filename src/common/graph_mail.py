@@ -4,6 +4,20 @@ import requests
 import msal
 from .utils import logger, DATA_DIR, save_zip_and_extract
 
+
+def _ensure_valid_ca_bundle():
+    """If REQUESTS_CA_BUNDLE/SSL_CERT_FILE points to a missing file, unset it to avoid TLS errors."""
+    for key in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        val = os.getenv(key)
+        if val and not os.path.exists(val):
+            try:
+                os.environ.pop(key, None)
+                logger.warning(f"Unset {key} because file not found: {val}")
+            except Exception:
+                pass
+
+_ensure_valid_ca_bundle()
+
 TENANT_ID     = os.getenv("TENANT_ID")
 CLIENT_ID     = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")

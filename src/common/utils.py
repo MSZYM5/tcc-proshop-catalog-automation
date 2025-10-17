@@ -5,6 +5,11 @@ import logging
 from dotenv import load_dotenv
 
 load_dotenv()
+# Try to make Requests trust Windows certificate store if available (helps behind corp proxies)
+try:
+    import certifi_win32  # noqa: F401
+except Exception:
+    pass
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL","INFO"),

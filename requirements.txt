@@ -1,0 +1,8 @@
+python-dotenv
+requests
+msal
+pandas
+openpyxl
+# Optional, for Windows corporate cert store trust
+certifi-win32
+openai

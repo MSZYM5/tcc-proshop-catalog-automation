@@ -8,8 +8,11 @@ from common.shopify_rest import (
     fetch_products_snapshot,
     get_locations,
     create_product,
+    create_variant,
     set_inventory_level,
     update_inventory_item_cost,
+    update_product_tags,
+    publish_product_all_channels,
 )
 
 
@@ -47,7 +50,7 @@ def _build_product_payload(prod_row: pd.Series, var_rows: pd.DataFrame, publish_
             return (0, float(s))
         except Exception:
             pass
-        order = ["XXS","XS","S","M","L","XL","2XL","3XL","4XL","5XL"]
+        order = ["2XS","XXS","XS","S","M","L","XL","2XL","3XL","4XL","5XL"]
         if s in order:
             return (1, order.index(s))
         return (2, s)
@@ -90,6 +93,9 @@ def _build_product_payload(prod_row: pd.Series, var_rows: pd.DataFrame, publish_
     }
     if product_type:
         payload["product_type"] = product_type
+    if publish_status == "active":
+        # Fallback to ensure Online Store visibility on older setups
+        payload["published_scope"] = "web"
     return payload
 
 
@@ -154,13 +160,40 @@ def upload_from_draft(
     if "Style-Color" in variants_df.columns:
         variants_df["Style-Color"] = variants_df["Style-Color"].astype(str)
 
-    # Existing handles to avoid duplicates
+    # Existing handles and SKUs to avoid duplicates; also capture tags and option names
     try:
         snapshot = fetch_products_snapshot()
         existing_handles = set(snapshot["handle"].astype(str))
+        # Build maps: handle -> product_id, product_id -> set(skus), product_id -> existing tags
+        handle_to_pid = {}
+        pid_to_skus = {}
+        pid_to_tags = {}
+        pid_to_option_names = {}
+        for _, row in snapshot.iterrows():
+            pid = int(row["product_id"]) if pd.notna(row["product_id"]) else None
+            if not pid:
+                continue
+            h = str(row.get("handle",""))
+            handle_to_pid[h] = pid
+            sku = str(row.get("sku",""))
+            if pid not in pid_to_skus:
+                pid_to_skus[pid] = set()
+            if sku:
+                pid_to_skus[pid].add(sku)
+            # Tags: same across rows; just capture first
+            if pid not in pid_to_tags:
+                pid_to_tags[pid] = str(row.get("tags",""))
+            # Option names captured from any row
+            o1 = str(row.get("option1_name",""))
+            o2 = str(row.get("option2_name",""))
+            pid_to_option_names[pid] = (o1, o2)
     except Exception as e:
         logger.warning(f"Upload: could not fetch existing products ({e}); proceeding without duplicate handle check")
         existing_handles = set()
+        handle_to_pid = {}
+        pid_to_skus = {}
+        pid_to_tags = {}
+        pid_to_option_names = {}
 
     # Gather locations once for inventory
     locations = []
@@ -175,6 +208,7 @@ def upload_from_draft(
     results = []
     prods_by_key = products_df.set_index(["style_code"], drop=False)
     available_styles = set(prods_by_key.index.astype(str))
+    publish_active = (publish_status == "active")
     for grp_key, group in variants_df.groupby(["style_code"]):
         sc = grp_key[0] if isinstance(grp_key, (tuple, list)) else grp_key
         key = str(sc).strip().upper()
@@ -189,9 +223,76 @@ def upload_from_draft(
                 prod_row = prod_row.iloc[0]
         handle = str(prod_row.get("Handle", "")).strip()
         if handle and handle in existing_handles:
-            results.append({"style": key, "status": "skipped", "reason": f"Handle exists: {handle}"})
+            # Update existing product: add new variants that don't exist by SKU and merge tags
+            pid = handle_to_pid.get(handle)
+            existing_skus = pid_to_skus.get(pid, set())
+            added = 0
+            # Merge tags
+            prior_tags = pid_to_tags.get(pid, "")
+            new_tags = str(prod_row.get("Tags",""))
+            merged = ", ".join(sorted({t.strip() for t in (prior_tags + "," + new_tags).split(",") if t.strip()}))
+            try:
+                update_product_tags(pid, merged)
+            except Exception as e:
+                logger.warning(f"Upload: update tags failed for product {pid}: {e}")
+
+            # Add new variants
+            for _, vr in group.iterrows():
+                sku = _safe_str(vr.get("Variant SKU",""))
+                if not sku or sku in existing_skus:
+                    continue
+                color = _safe_str(vr.get("Option1 Value","")) or _safe_str(vr.get("Color (by code)","")) or _safe_str(vr.get("color_code",""))
+                size  = _safe_str(vr.get("Option2 Value","")) or _safe_str(vr.get("size","")) or "Default"
+                price = vr.get("Variant Price", None)
+                compare_at = vr.get("Variant Compare At Price", None)
+                v_payload = {
+                    "option1": color or None,
+                    "option2": size or None,
+                    "sku": sku,
+                    "price": None if pd.isna(price) else float(price),
+                    "inventory_management": "shopify",
+                    "fulfillment_service": "manual",
+                }
+                if pd.notna(compare_at) and _safe_str(compare_at).strip() != "":
+                    v_payload["compare_at_price"] = float(compare_at)
+                try:
+                    v_created = create_variant(pid, v_payload)
+                    inv_item_id = v_created.get("inventory_item_id")
+                    # Cost
+                    if set_cost:
+                        cost = vr.get("Cost per item", None)
+                        if inv_item_id and pd.notna(cost):
+                            try:
+                                update_inventory_item_cost(inv_item_id, float(cost))
+                            except Exception as e:
+                                logger.warning(f"Upload: cost update failed for SKU {sku}: {e}")
+                    # Inventory
+                    if set_inventory and locations:
+                        qty = vr.get("Variant Inventory Qty", None)
+                        if pd.notna(qty):
+                            for loc in locations:
+                                try:
+                                    set_inventory_level(loc["id"], inv_item_id, int(qty))
+                                except Exception as e:
+                                    logger.warning(f"Upload: inventory set failed for SKU {sku} @loc {loc['id']}: {e}")
+                    added += 1
+                except Exception as e:
+                    logger.error(f"Upload: create variant failed for {key} SKU {sku}: {e}")
+            if publish_active:
+                try:
+                    publish_product_all_channels(pid)
+                except Exception as e:
+                    logger.warning(f"Upload: publish to channels failed for product {pid}: {e}")
+            results.append({
+                "style": key,
+                "status": "updated",
+                "product_id": pid,
+                "handle": handle,
+                "added_variants": added,
+            })
             continue
 
+        # Create new product
         payload = _build_product_payload(prod_row, group, publish_status)
         try:
             created = create_product(payload)
@@ -200,9 +301,7 @@ def upload_from_draft(
             results.append({"style": key, "status": "error", "reason": str(e)})
             continue
 
-        # Map created variants by SKU for cost/inventory
         created_variants = {str(v.get("sku", "")): v for v in created.get("variants", [])}
-
         # Inventory and cost updates
         for _, vr in group.iterrows():
             sku = str(vr.get("Variant SKU", "")).strip()
@@ -210,7 +309,6 @@ def upload_from_draft(
             if not cv:
                 continue
             inv_item_id = cv.get("inventory_item_id")
-            # Set cost if available
             if set_cost:
                 cost = vr.get("Cost per item", None)
                 try:
@@ -218,7 +316,6 @@ def upload_from_draft(
                         update_inventory_item_cost(inv_item_id, float(cost))
                 except Exception as e:
                     logger.warning(f"Upload: cost update failed for SKU {sku}: {e}")
-            # Set inventory if requested
             if set_inventory and locations:
                 qty = vr.get("Variant Inventory Qty", None)
                 if pd.notna(qty):
@@ -228,6 +325,11 @@ def upload_from_draft(
                         except Exception as e:
                             logger.warning(f"Upload: inventory set failed for SKU {sku} @loc {loc['id']}: {e}")
 
+        if publish_active:
+            try:
+                publish_product_all_channels(created.get("id"))
+            except Exception as e:
+                logger.warning(f"Upload: publish to channels failed for product {created.get('id')}: {e}")
         results.append({
             "style": key,
             "status": "created",

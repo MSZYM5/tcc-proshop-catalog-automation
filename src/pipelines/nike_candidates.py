@@ -85,6 +85,22 @@ def run_candidates(output_path: Path, subject_override: Optional[str] = None):
     # 4) Filter vs Shopify (SKU-based)
     scored["already_on_shopify"] = mark_already_listed_by_sku(scored, shopify_df)
 
+    # Style-level existence to flag potential new colors for an existing style
+    shop_text = (
+        shopify_df["tags"].astype(str) + " "
+        + shopify_df["handle"].astype(str) + " "
+        + shopify_df["title"].astype(str)
+    ).str.lower()
+
+    def _style_exists(style: str) -> bool:
+        s = str(style).lower().strip()
+        if not s:
+            return False
+        return shop_text.str.contains(s, na=False).any()
+
+    scored["style_exists_on_shopify"] = scored["style_code"].apply(_style_exists)
+    scored["new_color"] = (~scored["already_on_shopify"]) & (scored["style_exists_on_shopify"]) 
+
     # Curate columns for readability in export
     columns_display = [
         "style_code",
@@ -105,11 +121,16 @@ def run_candidates(output_path: Path, subject_override: Optional[str] = None):
     ]
     columns_display = [c for c in columns_display if c in scored.columns]
 
-    new_candidates = (
+    new_candidates_df = (
         scored[~scored["already_on_shopify"]]
         .copy()
         .sort_values("score_total", ascending=False)
-    )[columns_display]
+    )
+    if "new_color" in new_candidates_df.columns:
+        new_candidates_df["new_color"] = new_candidates_df["new_color"].map(lambda x: "Yes" if bool(x) else "No")
+    new_candidates = new_candidates_df[
+        columns_display + (["new_color"] if "new_color" in new_candidates_df.columns else [])
+    ]
 
     already = (
         scored[scored["already_on_shopify"]]
@@ -122,6 +143,5 @@ def run_candidates(output_path: Path, subject_override: Optional[str] = None):
         new_candidates.to_excel(xw, index=False, sheet_name="New Candidates")
         already.to_excel(xw, index=False, sheet_name="Already on Shopify")
 
-    print(
-        f"Wrote {output_path} — New: {len(new_candidates)}, Existing: {len(already)}"
-    )
+    print(f"Wrote {output_path} - New: {len(new_candidates)}, Existing: {len(already)}")
+

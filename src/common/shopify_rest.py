@@ -261,3 +261,56 @@ def set_inventory_level(location_id: int, inventory_item_id: int, available: int
 def update_inventory_item_cost(inventory_item_id: int, cost: float) -> dict:
     body = {"inventory_item": {"id": int(inventory_item_id), "cost": float(cost)}}
     return _put(f"/inventory_items/{int(inventory_item_id)}.json", body).get("inventory_item", {})
+
+
+def create_variant(product_id: int, variant_payload: dict) -> dict:
+    return _post(f"/products/{int(product_id)}/variants.json", {"variant": variant_payload}).get("variant", {})
+
+
+def update_product_tags(product_id: int, tags: str) -> dict:
+    body = {"product": {"id": int(product_id), "tags": tags}}
+    return _put(f"/products/{int(product_id)}.json", body).get("product", {})
+
+
+def list_publications() -> list[dict]:
+    base, headers = _base_and_headers()
+    verify = _requests_verify()
+    url = f"{base}/publications.json"
+    r = requests.get(url, headers=headers, timeout=60, verify=verify)
+    r.raise_for_status()
+    return r.json().get("publications", [])
+
+
+def publish_product_to_publication(publication_id: int, product_id: int) -> dict:
+    # REST: POST /publications/{publication_id}/resource_publications.json
+    path = f"/publications/{int(publication_id)}/resource_publications.json"
+    body = {
+        "resource_publication": {
+            "publication_id": int(publication_id),
+            "resource_type": "product",
+            "resource_id": int(product_id),
+        }
+    }
+    return _post(path, body)
+
+
+def publish_product_all_channels(product_id: int) -> None:
+    """Publish a product to every available publication.
+    Requires read_publications and write_publications scopes.
+    """
+    pubs = list_publications()
+    for p in pubs:
+        pub_id = p.get("id")
+        if not pub_id:
+            continue
+        try:
+            publish_product_to_publication(pub_id, product_id)
+            # Gentle pacing
+            time.sleep(0.2)
+        except requests.HTTPError as e:
+            # 403 usually means missing write_publications scope
+            raise
+        except Exception:
+            # Continue best-effort
+            time.sleep(0.2)
+            continue

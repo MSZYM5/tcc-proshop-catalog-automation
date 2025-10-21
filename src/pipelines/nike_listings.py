@@ -200,9 +200,13 @@ def _normalize_size(size_val: str, item_type: str) -> str:
     canon = s.upper().replace("-"," ").replace("  ", " ").strip()
     # Common names
     mapping = {
-        "X SMALL": "XS", "EXTRA SMALL": "XS", "SMALL": "S", "MEDIUM": "M", "LARGE": "L",
-        "X LARGE": "XL", "EXTRA LARGE": "XL", "XX LARGE": "2XL", "XXX LARGE": "3XL",
-        "XXL": "2XL", "XXXL": "3XL", "XXXXL": "4XL", "2X": "2XL", "3X": "3XL", "4X": "4XL",
+        "XX SMALL": "2XS", "XXS": "2XS", "2XS": "2XS",
+        "X SMALL": "XS", "EXTRA SMALL": "XS",
+        "SMALL": "S", "MEDIUM": "M", "LARGE": "L",
+        "X LARGE": "XL", "EXTRA LARGE": "XL",
+        "XX LARGE": "2XL", "XXX LARGE": "3XL",
+        "XXL": "2XL", "XXXL": "3XL", "XXXXL": "4XL",
+        "2X": "2XL", "3X": "3XL", "4X": "4XL",
     }
     if canon in mapping:
         return mapping[canon]
@@ -630,9 +634,28 @@ def prepare_listings_draft(
     logger.info(f"Listings: after selection filters -> {len(vdf)} variants")
     if missing_codes:
         logger.warning(f"Listings: selection codes not found in NuOrder data: {sorted(missing_codes)}")
-
-    if vdf.empty:
-        raise RuntimeError("Selection produced zero variants. Check SKUs/style-color codes.")
+        # Synthesize minimal rows for missing selections so we can proceed
+        synth_rows = []
+        for code in sorted(missing_codes):
+            try:
+                sc, cc = code.split("-", 1)
+                synth_rows.append({
+                    "style_code": sc.strip().upper(),
+                    "color_code": cc.strip().upper(),
+                    "vendor": "",
+                    "type": "",
+                    "season": "",
+                    "size": "",
+                    "sku": "",
+                    "qty": 0,
+                    "msrp": pd.NA,
+                    "nike_title_raw": sc.strip().upper(),
+                    "nike_color_name_raw": "",
+                })
+            except Exception:
+                continue
+        if synth_rows:
+            vdf = pd.concat([vdf, pd.DataFrame(synth_rows)], ignore_index=True)
 
     # Build a temporary product-level table at style+color (for reference), then collapse to style-level
     vdf["style_color"] = vdf["style_code"].astype(str) + "-" + vdf["color_code"].astype(str)
@@ -711,28 +734,29 @@ def prepare_listings_draft(
         return None
 
     def _product_tags(row):
-        tags = ["Nike", str(row["style_code"]).upper(), "Special Order"]
+        tags = ["Nike", str(row["style_code"]).upper()]
         title = str(row.get("Expanded Title", ""))
         gender = _detect_gender(title)
         top_tag = _top_level_tag(title, row.get("type",""))
         cat_tag = _category_from_title(title, gender)
-        if cat_tag:
-            tags.append(cat_tag)
-        else:
-            tags.append("Needs Category")
-        if top_tag:
+        # Footwear: only top-level tag
+        if top_tag and "Footwear" in top_tag:
             tags.append(top_tag)
+        else:
+            if cat_tag:
+                tags.append(cat_tag)
+            else:
+                tags.append("Needs Category")
+            if top_tag:
+                tags.append(top_tag)
         season = str(row.get("season", "")).strip()
         if season:
             tags.append(season)
         return ", ".join([t for t in tags if t])
     prod["Tags"] = prod.apply(_product_tags, axis=1)
     # Collections column: Vendor and top-level category
-    def _collections(row):
-        title = str(row.get("Expanded Title", ""))
-        top = _top_level_tag(title, row.get("type",""))
-        return "; ".join(["Nike", top])
-    prod["Collections"] = prod.apply(_collections, axis=1)
+    # Keep Collections empty (smart collections use tags)
+    prod["Collections"] = ""
     prod["Body HTML"] = "<p></p>"  # leave blank for MVP
     prod["Title Notes"] = ""  # Placeholder for unknown abbreviations, etc.
     # Append season if duplicates within batch or already exist on Shopify
@@ -775,20 +799,24 @@ def prepare_listings_draft(
     prod_light = prod[["style_code","Expanded Title","Product Type","season"]].copy()
     variants = variants.merge(prod_light, on=["style_code"], how="left")
     def _variant_tags(row):
-        tags = ["Nike", "Special Order", str(row['style_code']).upper()]
+        tags = ["Nike", str(row['style_code']).upper()]
         title = str(row.get("Expanded Title", ""))
         gender = _detect_gender(title)
         top = _top_level_tag(title, row.get("type",""))
         cat = _category_from_title(title, gender)
-        if cat:
-            tags.append(cat)
-        else:
-            tags.append("Needs Category")
-        if top:
+        if top and "Footwear" in top:
+            # Footwear: only top-level tag
             tags.append(top)
-        # Unisex: Headwear and Socks should include Accessories
-        if cat in {"Headwear","Socks"} and "Accessories" not in tags:
-            tags.append("Accessories")
+        else:
+            if cat:
+                tags.append(cat)
+            else:
+                tags.append("Needs Category")
+            if top:
+                tags.append(top)
+            # Unisex: Headwear and Socks should include Accessories
+            if cat in {"Headwear","Socks"} and "Accessories" not in tags:
+                tags.append("Accessories")
         season = str(row.get("season", "")).strip()
         if season:
             tags.append(season)
@@ -803,7 +831,10 @@ def prepare_listings_draft(
             "style_code","Title","Handle","Vendor","Product Type","Tags","Collections","Body HTML",
             "season","msrp","total_inventory","Title Notes",
         ]
-        prod[[c for c in prod_cols if c in prod.columns]].to_excel(xw, index=False, sheet_name="Products")
+        # Ensure Body HTML starts with Style code
+        prod_out = prod.copy()
+        prod_out["Body HTML"] = prod_out.apply(lambda r: f"Style: {str(r['style_code']).upper()}", axis=1)
+        prod_out[[c for c in prod_cols if c in prod_out.columns]].to_excel(xw, index=False, sheet_name="Products")
 
         var_cols = [
             # MVP variant sheet with explicit columns requested
@@ -823,7 +854,19 @@ def prepare_listings_draft(
             "Variant Inventory Qty","Variant Compare At Price",
             "size","msrp","qty","type","Variant Notes",
         ]
-        variants[[c for c in var_cols if c in variants.columns]].to_excel(xw, index=False, sheet_name="Variants")
+        # Order variants by style_code, then color, then size order
+        def _size_rank(val: str):
+            s = str(val).strip().upper()
+            try:
+                return (0, float(s))
+            except Exception:
+                order = {"2XS":0,"XXS":1,"XS":2,"S":3,"M":4,"L":5,"XL":6,"2XL":7,"3XL":8,"4XL":9,"5XL":10}
+                return (1, order.get(s, 999), s)
+        v_out = variants.copy()
+        v_out["_size_key"] = v_out["Option2 Value"].apply(_size_rank)
+        v_out = v_out.sort_values(by=["style_code","Option1 Value","_size_key"], kind="mergesort")
+        v_out = v_out.drop(columns=["_size_key"]) 
+        v_out[[c for c in var_cols if c in v_out.columns]].to_excel(xw, index=False, sheet_name="Variants")
     logger.info(f"Listings: wrote Excel draft -> {output_path}")
 
     return output_path
